@@ -6,13 +6,11 @@ import logging
 import subprocess
 import threading
 from datetime import datetime, timedelta
+from email.message import EmailMessage
 import paho.mqtt.client as mqtt
 import mysql.connector
-from dotenv import load_dotenv
 
-load_dotenv()
-
-CONFIG_PATH = os.getenv('MQTT_MONITOR_CONFIG', 'config.ini')
+CONFIG_PATH_DEFAULT = 'config.ini'
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,48 +22,103 @@ logging.basicConfig(
 )
 
 
-def load_db_config(path=CONFIG_PATH):
+def _get(parser, section, key, default=None, cast=None):
+    """Read a key from ENV first, then INI, falling back to default.
+    Empty INI values fall back to default so the template can ship blanks."""
+    env_key = f"{section.upper()}_{key.upper()}"
+    value = os.getenv(env_key)
+    if value is None:
+        if parser.has_option(section, key):
+            raw = parser.get(section, key)
+            value = raw if raw != '' else default
+        else:
+            value = default
+    if value is None:
+        return None
+    if cast:
+        return cast(value)
+    return value
+
+
+def load_config(path=None):
+    path = path or os.getenv('MQTT_MONITOR_CONFIG', CONFIG_PATH_DEFAULT)
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Config file not found: {path}. Copy config.ini.example to {path}."
         )
     parser = configparser.RawConfigParser()
     parser.read(path)
-    section = 'REMOTE_DB'
-    if not parser.has_section(section):
-        raise ValueError(f"Missing [{section}] section in {path}")
-    cfg = dict(parser.items(section))
-    if 'port' not in cfg:
-        cfg['port'] = '3306'
-    return cfg
+
+    required = ['MQTT', 'PING', 'ALERT', 'SMTP', 'REMOTE_DB']
+    missing = [s for s in required if not parser.has_section(s)]
+    if missing:
+        raise ValueError(f"Missing sections in {path}: {', '.join(missing)}")
+
+    return {
+        'mqtt': {
+            'broker': _get(parser, 'MQTT', 'broker'),
+            'port': _get(parser, 'MQTT', 'port', '1883', int),
+            'username': _get(parser, 'MQTT', 'username'),
+            'password': _get(parser, 'MQTT', 'password'),
+            'publisher_client_id': _get(parser, 'MQTT', 'publisher_client_id', 'asenta'),
+            'warmup_seconds': _get(parser, 'MQTT', 'warmup_seconds', '10', int),
+        },
+        'ping': {
+            'host': _get(parser, 'PING', 'host', '193.5.176.14'),
+            'attempts': _get(parser, 'PING', 'attempts', '3', int),
+            'timeout': _get(parser, 'PING', 'timeout', '2', int),
+        },
+        'alert': {
+            'after_minutes': _get(parser, 'ALERT', 'after_minutes', '60', int),
+            'email_from': _get(parser, 'ALERT', 'email_from'),
+            'email_to': _get(parser, 'ALERT', 'email_to'),
+            'email_cc': _get(parser, 'ALERT', 'email_cc', ''),
+            'email_bcc': _get(parser, 'ALERT', 'email_bcc', ''),
+        },
+        'smtp': {
+            'server': _get(parser, 'SMTP', 'server'),
+            'port': _get(parser, 'SMTP', 'port', '587', int),
+            'username': _get(parser, 'SMTP', 'username'),
+            'password': _get(parser, 'SMTP', 'password'),
+            'tls': _get(parser, 'SMTP', 'tls', 'auto'),
+        },
+        'db': {
+            'host': _get(parser, 'REMOTE_DB', 'host'),
+            'port': _get(parser, 'REMOTE_DB', 'port', '3306', int),
+            'database': _get(parser, 'REMOTE_DB', 'database'),
+            'user': _get(parser, 'REMOTE_DB', 'user'),
+            'password': _get(parser, 'REMOTE_DB', 'password'),
+        },
+    }
 
 
 class MQTTMonitor:
     def __init__(self):
+        self.cfg = load_config()
         self.last_message_time = None
         self.alert_sent = False
         self.conn = None
-        self.ping_result = None
         self.client = mqtt.Client()
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
 
-        self.client.username_pw_set(
-            os.getenv('MQTT_USERNAME'),
-            os.getenv('MQTT_PASSWORD')
-        )
+        if self.cfg['mqtt']['username']:
+            self.client.username_pw_set(
+                self.cfg['mqtt']['username'],
+                self.cfg['mqtt']['password']
+            )
 
         self.connect_db()
 
     def connect_db(self):
+        db = self.cfg['db']
         try:
-            cfg = load_db_config(os.getenv('MQTT_MONITOR_CONFIG', CONFIG_PATH))
             self.conn = mysql.connector.connect(
-                host=cfg['host'],
-                port=int(cfg.get('port', 3306)),
-                database=cfg['database'],
-                user=cfg['user'],
-                password=cfg['password'],
+                host=db['host'],
+                port=db['port'],
+                database=db['database'],
+                user=db['user'],
+                password=db['password'],
                 charset='utf8mb4',
                 use_pure=True,
                 connection_timeout=10,
@@ -78,7 +131,7 @@ class MQTTMonitor:
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             logging.info("Connected to MQTT broker")
-            client.subscribe(f"{os.getenv('PUBLISHER_CLIENT_ID', 'asenta')}/#")
+            client.subscribe(f"{self.cfg['mqtt']['publisher_client_id']}/#")
         else:
             logging.error(f"Failed to connect to MQTT broker, return code {rc}")
 
@@ -101,9 +154,9 @@ class MQTTMonitor:
             return False
 
     def check_ping(self):
-        host = os.getenv('PING_HOST', '193.5.176.14')
-        attempts = int(os.getenv('PING_ATTEMPTS', 3))
-        timeout = int(os.getenv('PING_TIMEOUT', 2))
+        host = self.cfg['ping']['host']
+        attempts = self.cfg['ping']['attempts']
+        timeout = self.cfg['ping']['timeout']
         results = []
 
         threads = []
@@ -127,7 +180,7 @@ class MQTTMonitor:
             return False, "No messages received yet"
 
         silence_duration = datetime.now() - self.last_message_time
-        threshold = timedelta(minutes=int(os.getenv('ALERT_AFTER_MINUTES', 60)))
+        threshold = timedelta(minutes=self.cfg['alert']['after_minutes'])
 
         is_active = silence_duration < threshold
         status_msg = (
@@ -146,7 +199,7 @@ class MQTTMonitor:
                 (publisher, status, message_count, last_message, ping_failed)
                 VALUES (%s, %s, %s, %s, %s)
             """, (
-                os.getenv('PUBLISHER_CLIENT_ID', 'asenta'),
+                self.cfg['mqtt']['publisher_client_id'],
                 'OK' if (is_active and not ping_failed) else 'ERROR',
                 1 if is_active else 0,
                 self.last_message_time if is_active else None,
@@ -162,11 +215,39 @@ class MQTTMonitor:
             except Exception:
                 pass
 
+    def _parse_recipients(self, value):
+        if not value:
+            return []
+        return [addr.strip() for addr in value.split(',') if addr.strip()]
+
+    def _open_smtp(self):
+        smtp = self.cfg['smtp']
+        host = smtp['server']
+        port = smtp['port']
+        mode = (smtp.get('tls') or 'auto').lower()
+        if mode == 'auto':
+            if port == 465:
+                server = smtplib.SMTP_SSL(host, port, timeout=10)
+            else:
+                server = smtplib.SMTP(host, port, timeout=10)
+                try:
+                    server.starttls()
+                except smtplib.SMTPNotSupportedError:
+                    pass
+        elif mode == 'ssl':
+            server = smtplib.SMTP_SSL(host, port, timeout=10)
+        elif mode == 'starttls':
+            server = smtplib.SMTP(host, port, timeout=10)
+            server.starttls()
+        else:
+            server = smtplib.SMTP(host, port, timeout=10)
+        return server
+
     def send_alert(self, sections):
         if self.alert_sent or not sections:
             return
 
-        publisher = os.getenv('PUBLISHER_CLIENT_ID', 'asenta')
+        publisher = self.cfg['mqtt']['publisher_client_id']
         subject = f"MQTT Alert - {publisher}"
         if len(sections) > 1:
             subject += f" ({len(sections)} issues)"
@@ -177,39 +258,51 @@ class MQTTMonitor:
             body_lines.append(content)
             body_lines.append("")
 
-        msg = f"Subject: {subject}\n\n" + "\n".join(body_lines)
+        sender = self.cfg['alert']['email_from']
+        to_addrs = self._parse_recipients(self.cfg['alert']['email_to'])
+        cc_addrs = self._parse_recipients(self.cfg['alert']['email_cc'])
+        bcc_addrs = self._parse_recipients(self.cfg['alert']['email_bcc'])
+
+        if not sender or not to_addrs:
+            logging.error("ALERT email_from or email_to missing; cannot send alert")
+            return
+
+        msg = EmailMessage()
+        msg['Subject'] = subject
+        msg['From'] = sender
+        msg['To'] = ', '.join(to_addrs)
+        if cc_addrs:
+            msg['Cc'] = ', '.join(cc_addrs)
+        msg.set_content("\n".join(body_lines))
+
+        all_recipients = to_addrs + cc_addrs + bcc_addrs
 
         try:
-            server = smtplib.SMTP(
-                os.getenv('SMTP_SERVER'),
-                int(os.getenv('SMTP_PORT', 2525))
-            )
-            server.starttls()
+            server = self._open_smtp()
             server.login(
-                os.getenv('SMTP_USERNAME'),
-                os.getenv('SMTP_PASSWORD')
+                self.cfg['smtp']['username'],
+                self.cfg['smtp']['password']
             )
-            server.sendmail(
-                os.getenv('ALERT_EMAIL_FROM'),
-                os.getenv('ALERT_EMAIL_TO'),
-                msg
-            )
+            server.sendmail(sender, all_recipients, msg.as_string())
             server.quit()
             self.alert_sent = True
-            logging.info(f"Alert email sent ({len(sections)} issue(s))")
+            logging.info(
+                f"Alert email sent to {len(all_recipients)} recipient(s): "
+                f"{len(to_addrs)} to, {len(cc_addrs)} cc, {len(bcc_addrs)} bcc"
+            )
         except Exception as e:
             logging.error(f"Failed to send alert: {e}")
 
     def run(self):
         try:
             self.client.connect(
-                os.getenv('MQTT_BROKER'),
-                int(os.getenv('MQTT_PORT', 1883)),
+                self.cfg['mqtt']['broker'],
+                self.cfg['mqtt']['port'],
                 60
             )
             self.client.loop_start()
 
-            _time.sleep(int(os.getenv('MQTT_WARMUP_SECONDS', '10')))
+            _time.sleep(self.cfg['mqtt']['warmup_seconds'])
 
             is_active, status_msg = self.check_publisher_activity()
             ping_failed = self.check_ping()
@@ -219,8 +312,8 @@ class MQTTMonitor:
             if not is_active:
                 sections.append(("Publisher silence", status_msg))
             if ping_failed:
-                host = os.getenv('PING_HOST', '193.5.176.14')
-                attempts = int(os.getenv('PING_ATTEMPTS', 3))
+                host = self.cfg['ping']['host']
+                attempts = self.cfg['ping']['attempts']
                 sections.append((
                     "Ping failure",
                     f"Host {host} unreachable ({attempts} parallel attempts all failed)"

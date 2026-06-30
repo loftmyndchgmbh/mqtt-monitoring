@@ -3,6 +3,7 @@ Tests for mqtt_monitor.py using unittest.mock — no real broker, DB, or SMTP.
 """
 import os
 import sys
+import smtplib
 import threading
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
@@ -14,68 +15,110 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mqtt_monitor as mm
 
 
-@pytest.fixture
-def env_only(monkeypatch):
-    """Sets ENV vars but does NOT touch MQTT_MONITOR_CONFIG."""
-    monkeypatch.setenv("MQTT_BROKER", "test-broker")
-    monkeypatch.setenv("MQTT_PORT", "1883")
-    monkeypatch.setenv("MQTT_USERNAME", "user")
-    monkeypatch.setenv("MQTT_PASSWORD", "pass")
-    monkeypatch.setenv("PUBLISHER_CLIENT_ID", "asenta")
-    monkeypatch.setenv("PING_HOST", "193.5.176.14")
-    monkeypatch.setenv("PING_ATTEMPTS", "3")
-    monkeypatch.setenv("PING_TIMEOUT", "2")
-    monkeypatch.setenv("ALERT_AFTER_MINUTES", "60")
-    monkeypatch.setenv("ALERT_EMAIL_FROM", "from@test.com")
-    monkeypatch.setenv("ALERT_EMAIL_TO", "to@test.com")
-    monkeypatch.setenv("SMTP_SERVER", "smtp.test.com")
-    monkeypatch.setenv("SMTP_PORT", "587")
-    monkeypatch.setenv("SMTP_USERNAME", "smtpuser")
-    monkeypatch.setenv("SMTP_PASSWORD", "smtppass")
-    return monkeypatch
+def write_config(path, **overrides):
+    base = {
+        'MQTT': {
+            'broker': 'test-broker',
+            'port': '1883',
+            'username': 'user',
+            'password': 'pass',
+            'publisher_client_id': 'asenta',
+            'warmup_seconds': '10',
+        },
+        'PING': {
+            'host': '193.5.176.14',
+            'attempts': '3',
+            'timeout': '2',
+        },
+        'ALERT': {
+            'after_minutes': '60',
+            'email_from': 'from@test.com',
+            'email_to': 'to@test.com',
+            'email_cc': '',
+            'email_bcc': '',
+        },
+        'SMTP': {
+            'server': 'smtp.test.com',
+            'port': '587',
+            'username': 'smtpuser',
+            'password': 'smtppass',
+            'tls': 'auto',
+        },
+        'REMOTE_DB': {
+            'host': 'localhost',
+            'port': '3306',
+            'database': 'mqtt_monitoring',
+            'user': 'user',
+            'password': 'pass',
+        },
+    }
+    for section, values in overrides.items():
+        base[section].update(values)
+
+    with open(path, 'w') as f:
+        for section, values in base.items():
+            f.write(f"[{section}]\n")
+            for k, v in values.items():
+                f.write(f"{k} = {v}\n")
+            f.write("\n")
 
 
 @pytest.fixture
-def db_config_file(tmp_path, monkeypatch):
+def config_file(tmp_path, monkeypatch):
     p = tmp_path / "config.ini"
-    p.write_text(
-        "[REMOTE_DB]\n"
-        "host = localhost\n"
-        "database = mqtt_monitoring\n"
-        "user = user\n"
-        "password = pass\n"
-    )
-    monkeypatch.setenv("MQTT_MONITOR_CONFIG", str(p))
+    write_config(str(p))
+    monkeypatch.setenv('MQTT_MONITOR_CONFIG', str(p))
     return str(p)
 
 
 @pytest.fixture
-def monitor(env_only, db_config_file, monkeypatch):
+def monitor(config_file, monkeypatch):
     monkeypatch.setattr(mm.mqtt, "Client", MagicMock())
     monkeypatch.setattr(mm.mysql.connector, "connect", MagicMock(return_value=MagicMock()))
     return mm.MQTTMonitor()
 
 
-# ---------- load_db_config ----------
+# ---------- load_config ----------
 
-def test_load_db_config_missing_file():
+def test_load_config_missing_file():
     with pytest.raises(FileNotFoundError):
-        mm.load_db_config("/tmp/does-not-exist-12345.ini")
+        mm.load_config('/tmp/does-not-exist-12345.ini')
 
 
-def test_load_db_config_missing_section(tmp_path):
+def test_load_config_missing_section(tmp_path, monkeypatch):
     p = tmp_path / "config.ini"
-    p.write_text("[OTHER]\nfoo = bar\n")
+    p.write_text("[MQTT]\nbroker = h\n")
+    monkeypatch.setenv('MQTT_MONITOR_CONFIG', str(p))
     with pytest.raises(ValueError):
-        mm.load_db_config(str(p))
+        mm.load_config(str(p))
 
 
-def test_load_db_config_default_port(tmp_path):
+def test_load_config_default_values(tmp_path, monkeypatch):
     p = tmp_path / "config.ini"
-    p.write_text("[REMOTE_DB]\nhost = h\ndatabase = d\nuser = u\npassword = p\n")
-    cfg = mm.load_db_config(str(p))
-    assert cfg['port'] == '3306'
-    assert cfg['host'] == 'h'
+    p.write_text(
+        "[MQTT]\nbroker = h\npublisher_client_id =\n"
+        "[PING]\n"
+        "[ALERT]\nemail_from = a\nemail_to = b\n"
+        "[SMTP]\nserver = s\nusername = u\npassword = p\n"
+        "[REMOTE_DB]\nhost = h\ndatabase = d\nuser = u\npassword = p\n"
+    )
+    monkeypatch.setenv('MQTT_MONITOR_CONFIG', str(p))
+    cfg = mm.load_config(str(p))
+    assert cfg['mqtt']['publisher_client_id'] == 'asenta'
+    assert cfg['mqtt']['port'] == 1883
+    assert cfg['ping']['host'] == '193.5.176.14'
+    assert cfg['smtp']['port'] == 587
+
+
+def test_load_config_env_override(tmp_path, monkeypatch):
+    p = tmp_path / "config.ini"
+    write_config(str(p))
+    monkeypatch.setenv('MQTT_MONITOR_CONFIG', str(p))
+    monkeypatch.setenv('MQTT_BROKER', 'env-override.example.com')
+    monkeypatch.setenv('ALERT_AFTER_MINUTES', '5')
+    cfg = mm.load_config(str(p))
+    assert cfg['mqtt']['broker'] == 'env-override.example.com'
+    assert cfg['alert']['after_minutes'] == 5
 
 
 # ---------- check_ping ----------
@@ -135,6 +178,7 @@ def test_log_status_ok(monitor):
     monitor.last_message_time = datetime.now()
     monitor.log_status(True, "ok", ping_failed=False)
     args = _cur_args(monitor)
+    assert args[0] == 'asenta'
     assert args[1] == "OK"
     assert args[2] == 1
     assert args[4] == 0
@@ -148,7 +192,6 @@ def test_log_status_error_silence(monitor):
 
 
 def test_log_status_error_ping_only(monitor):
-    """Publisher active but ping failed → still ERROR, message_count=1, ping_failed=1."""
     monitor.last_message_time = datetime.now()
     monitor.log_status(True, "ok", ping_failed=True)
     args = _cur_args(monitor)
@@ -164,33 +207,132 @@ def test_log_status_uses_mysql_placeholder(monitor):
     assert "?" not in sql
 
 
+# ---------- _parse_recipients ----------
+
+def test_parse_recipients_single(monitor):
+    assert monitor._parse_recipients('a@b.c') == ['a@b.c']
+
+
+def test_parse_recipients_multiple(monitor):
+    assert monitor._parse_recipients('a@b.c, d@e.f ,g@h.i') == ['a@b.c', 'd@e.f', 'g@h.i']
+
+
+def test_parse_recipients_empty(monitor):
+    assert monitor._parse_recipients('') == []
+    assert monitor._parse_recipients(None) == []
+
+
+# ---------- _open_smtp (TLS auto) ----------
+
+def test_smtp_auto_port_465_uses_ssl(monitor):
+    monitor.cfg['smtp']['port'] = 465
+    with patch.object(mm.smtplib, "SMTP_SSL") as ssl_mock, \
+         patch.object(mm.smtplib, "SMTP") as plain_mock:
+        monitor._open_smtp()
+        ssl_mock.assert_called_once()
+        plain_mock.assert_not_called()
+
+
+def test_smtp_auto_port_587_uses_starttls(monitor):
+    monitor.cfg['smtp']['port'] = 587
+    server = MagicMock()
+    with patch.object(mm.smtplib, "SMTP", return_value=server) as plain_mock, \
+         patch.object(mm.smtplib, "SMTP_SSL") as ssl_mock:
+        monitor._open_smtp()
+        plain_mock.assert_called_once()
+        server.starttls.assert_called_once()
+        ssl_mock.assert_not_called()
+
+
+def test_smtp_auto_port_2525_no_tls(monitor):
+    """Mailtrap 2525 doesn't support STARTTLS — must not raise."""
+    monitor.cfg['smtp']['port'] = 2525
+    server = MagicMock()
+    server.starttls.side_effect = smtplib.SMTPNotSupportedError()
+    with patch.object(mm.smtplib, "SMTP", return_value=server):
+        result = monitor._open_smtp()
+        assert result is server
+
+
+def test_smtp_auto_unsupported_starttls_raises_other_errors(monitor):
+    """Non-SMTPNotSupportedError STARTTLS errors must propagate."""
+    monitor.cfg['smtp']['port'] = 2525
+    server = MagicMock()
+    server.starttls.side_effect = RuntimeError("tls broken")
+    with patch.object(mm.smtplib, "SMTP", return_value=server):
+        with pytest.raises(RuntimeError):
+            monitor._open_smtp()
+
+
+def test_smtp_explicit_starttls(monitor):
+    monitor.cfg['smtp']['tls'] = 'starttls'
+    server = MagicMock()
+    with patch.object(mm.smtplib, "SMTP", return_value=server):
+        monitor._open_smtp()
+        server.starttls.assert_called_once()
+
+
+def test_smtp_explicit_ssl(monitor):
+    monitor.cfg['smtp']['tls'] = 'ssl'
+    monitor.cfg['smtp']['port'] = 587  # explicit override beats auto
+    with patch.object(mm.smtplib, "SMTP_SSL") as ssl_mock, \
+         patch.object(mm.smtplib, "SMTP") as plain_mock:
+        monitor._open_smtp()
+        ssl_mock.assert_called_once()
+        plain_mock.assert_not_called()
+
+
+def test_smtp_explicit_none(monitor):
+    monitor.cfg['smtp']['tls'] = 'none'
+    server = MagicMock()
+    with patch.object(mm.smtplib, "SMTP", return_value=server):
+        monitor._open_smtp()
+        server.starttls.assert_not_called()
+
+
 # ---------- send_alert ----------
+
+def _sendmail_args(smtp_mock):
+    """Extract (sender, recipients, payload) from sendmail call."""
+    return smtp_mock.sendmail.call_args[0]
+
 
 def test_send_alert_combined(monitor):
     smtp_mock = MagicMock()
-    with patch.object(mm.smtplib, "SMTP", return_value=smtp_mock):
+    with patch.object(monitor, "_open_smtp", return_value=smtp_mock):
         monitor.send_alert([
             ("Publisher silence", "silent 75 min"),
             ("Ping failure", "host unreachable"),
         ])
-    sent_msg = smtp_mock.sendmail.call_args[0][2]
-    assert "Publisher silence" in sent_msg
-    assert "Ping failure" in sent_msg
-    assert "silent 75 min" in sent_msg
-    assert "host unreachable" in sent_msg
+    sender, recipients, payload = _sendmail_args(smtp_mock)
+    assert "Publisher silence" in payload
+    assert "Ping failure" in payload
+    assert "silent 75 min" in payload
 
 
-def test_send_alert_only_silence(monitor):
+def test_send_alert_multiple_recipients(monitor):
+    monitor.cfg['alert']['email_to'] = 'a@x.ch, b@y.ch'
+    monitor.cfg['alert']['email_cc'] = 'c@z.ch'
     smtp_mock = MagicMock()
-    with patch.object(mm.smtplib, "SMTP", return_value=smtp_mock):
-        monitor.send_alert([("Publisher silence", "silent")])
-    sent_msg = smtp_mock.sendmail.call_args[0][2]
-    assert "(2 issues)" not in sent_msg.split("\n")[0]
+    with patch.object(monitor, "_open_smtp", return_value=smtp_mock):
+        monitor.send_alert([("Ping failure", "x")])
+    sender, recipients, payload = _sendmail_args(smtp_mock)
+    assert recipients == ['a@x.ch', 'b@y.ch', 'c@z.ch']
+
+
+def test_send_alert_uses_email_message(monitor):
+    smtp_mock = MagicMock()
+    with patch.object(monitor, "_open_smtp", return_value=smtp_mock):
+        monitor.send_alert([("Ping failure", "host x")])
+    payload = _sendmail_args(smtp_mock)[2]
+    assert payload.startswith("Subject:")
+    assert "asenta" in payload
+    assert "host x" in payload
 
 
 def test_send_alert_no_sections(monitor):
     smtp_mock = MagicMock()
-    with patch.object(mm.smtplib, "SMTP", return_value=smtp_mock):
+    with patch.object(monitor, "_open_smtp", return_value=smtp_mock):
         monitor.send_alert([])
     smtp_mock.sendmail.assert_not_called()
 
@@ -198,15 +340,23 @@ def test_send_alert_no_sections(monitor):
 def test_send_alert_not_resent_when_flag_set(monitor):
     monitor.alert_sent = True
     smtp_mock = MagicMock()
-    with patch.object(mm.smtplib, "SMTP", return_value=smtp_mock):
+    with patch.object(monitor, "_open_smtp", return_value=smtp_mock):
         monitor.send_alert([("Ping failure", "x")])
     smtp_mock.sendmail.assert_not_called()
 
 
 def test_send_alert_smtp_failure(monitor):
-    with patch.object(mm.smtplib, "SMTP", side_effect=Exception("smtp boom")):
+    with patch.object(monitor, "_open_smtp", side_effect=Exception("smtp boom")):
         monitor.send_alert([("Ping failure", "x")])
     assert monitor.alert_sent is False
+
+
+def test_send_alert_missing_recipients(monitor):
+    monitor.cfg['alert']['email_to'] = ''
+    smtp_mock = MagicMock()
+    with patch.object(monitor, "_open_smtp", return_value=smtp_mock):
+        monitor.send_alert([("Ping failure", "x")])
+    smtp_mock.sendmail.assert_not_called()
 
 
 # ---------- on_message ----------
@@ -231,8 +381,8 @@ def test_run_all_ok(monitor):
     monitor.check_ping = MagicMock(return_value=False)
     monitor.log_status = MagicMock()
     monitor.send_alert = MagicMock()
-    with patch.dict(os.environ, {"MQTT_WARMUP_SECONDS": "0"}):
-        monitor.run()
+    monitor.cfg['mqtt']['warmup_seconds'] = 0
+    monitor.run()
     monitor.log_status.assert_called_once_with(True, "Publisher active (1.0 min ago)", False)
     monitor.send_alert.assert_not_called()
 
@@ -245,8 +395,8 @@ def test_run_both_issues(monitor):
     monitor.check_ping = MagicMock(return_value=True)
     monitor.log_status = MagicMock()
     monitor.send_alert = MagicMock()
-    with patch.dict(os.environ, {"MQTT_WARMUP_SECONDS": "0"}):
-        monitor.run()
+    monitor.cfg['mqtt']['warmup_seconds'] = 0
+    monitor.run()
     monitor.send_alert.assert_called_once()
     sections = monitor.send_alert.call_args[0][0]
     assert len(sections) == 2

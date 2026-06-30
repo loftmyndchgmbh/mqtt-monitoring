@@ -1,6 +1,40 @@
+[MQTT]
+broker = your-broker-url
+port = 1883
+username = your-username
+password = your-password
+publisher_client_id = asenta
+warmup_seconds = 10
+
+[PING]
+host = 193.5.176.14
+attempts = 3
+timeout = 2
+
+[ALERT]
+after_minutes = 60
+email_from = alert@yourdomain.com
+email_to = admin@yourdomain.com
+email_cc =
+email_bcc =
+
+[SMTP]
+server = sandbox.smtp.mailtrap.io
+port = 2525
+username = your-mailtrap-username
+password = your-mailtrap-password
+tls = auto
+
 [REMOTE_DB]
 host = your-cyon-host.cyon.ch
 port = 3306
 database = your-database-name
 user = your-db-user
 password = your-db-password
+
+; Notes:
+; - Restrict file permissions: chmod 600 config.ini
+; - tls options for [SMTP]: auto (default), ssl, starttls, none
+; - email_to / email_cc / email_bcc accept comma-separated lists
+; - Override any value via environment: MQTT_BROKER, ALERT_EMAIL_TO, etc.
+; - Override config path: MQTT_MONITOR_CONFIG=/etc/mqtt-monitoring/config.ini
