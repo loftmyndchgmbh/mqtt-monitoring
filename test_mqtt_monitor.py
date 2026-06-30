@@ -381,6 +381,7 @@ def test_run_all_ok(monitor):
     monitor.check_ping = MagicMock(return_value=False)
     monitor.log_status = MagicMock()
     monitor.send_alert = MagicMock()
+    monitor._recent_alert_sent = MagicMock(return_value=False)
     monitor.cfg['mqtt']['warmup_seconds'] = 0
     monitor.run()
     monitor.log_status.assert_called_once_with(True, "Publisher active (1.0 min ago)", False)
@@ -395,11 +396,50 @@ def test_run_both_issues(monitor):
     monitor.check_ping = MagicMock(return_value=True)
     monitor.log_status = MagicMock()
     monitor.send_alert = MagicMock()
+    monitor._recent_alert_sent = MagicMock(return_value=False)
     monitor.cfg['mqtt']['warmup_seconds'] = 0
     monitor.run()
     monitor.send_alert.assert_called_once()
     sections = monitor.send_alert.call_args[0][0]
     assert len(sections) == 2
+
+
+def test_run_skips_alert_when_recently_sent(monitor):
+    """Anti-spam: if ERROR was logged <60min ago, skip email."""
+    monitor.client.connect = MagicMock()
+    monitor.client.loop_start = MagicMock()
+    monitor.client.loop_stop = MagicMock()
+    monitor.check_publisher_activity = MagicMock(return_value=(True, "Publisher active"))
+    monitor.check_ping = MagicMock(return_value=True)
+    monitor.log_status = MagicMock()
+    monitor.send_alert = MagicMock()
+    monitor._recent_alert_sent = MagicMock(return_value=True)
+    monitor.cfg['mqtt']['warmup_seconds'] = 0
+    monitor.run()
+    monitor.send_alert.assert_not_called()
+
+
+def test_recent_alert_sent_true(monitor):
+    cur = monitor.conn.cursor.return_value
+    cur.fetchone.return_value = (datetime.now() - timedelta(minutes=10),)
+    assert monitor._recent_alert_sent(within_minutes=60) is True
+
+
+def test_recent_alert_sent_false_old(monitor):
+    cur = monitor.conn.cursor.return_value
+    cur.fetchone.return_value = (datetime.now() - timedelta(hours=2),)
+    assert monitor._recent_alert_sent(within_minutes=60) is False
+
+
+def test_recent_alert_sent_false_no_row(monitor):
+    cur = monitor.conn.cursor.return_value
+    cur.fetchone.return_value = None
+    assert monitor._recent_alert_sent(within_minutes=60) is False
+
+
+def test_recent_alert_sent_db_error(monitor):
+    monitor.conn.cursor.side_effect = Exception("db boom")
+    assert monitor._recent_alert_sent(within_minutes=60) is False
 
 
 def test_run_cleanup_on_exception(monitor):

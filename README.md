@@ -109,6 +109,7 @@ Port 587 with STARTTLS is correct. The normal Gmail login password does **not** 
    - Checks if silence duration exceeds `[ALERT] after_minutes`
    - Logs combined status to `mqtt_status` (with `ping_failed` flag)
    - Sends one email summarizing all detected issues
+   - **Anti-spam**: skips email if an `ERROR` status was logged for this publisher within the last hour (the DB entry is still written)
    - Resets alert flag when communication resumes
 
 ## Database Schema (MariaDB / Cyon)
@@ -154,4 +155,4 @@ python -m venv .venv
 .venv/bin/pytest test_mqtt_monitor.py -v
 ```
 
-35 tests cover config parsing (incl. ENV override), ping (parallel/serial behavior), publisher activity thresholds, DB logging (OK/ERROR combinations + MySQL placeholder), recipient parsing (comma lists, blanks), SMTP TLS auto-detection per port and explicit modes (incl. graceful STARTTLS-not-supported fallback), combined email alerts (`EmailMessage` API, subject, body, To/Cc/Bcc, anti-spam flag, SMTP failure, missing recipients), MQTT message handling, and full `run()` lifecycle including cleanup on exceptions. All external dependencies (`paho-mqtt`, `mysql.connector`, `smtplib`) are mocked — no broker, DB, or SMTP server required.
+35 tests cover config parsing (incl. ENV override), ping (parallel/serial behavior), publisher activity thresholds, DB logging (OK/ERROR combinations + MySQL placeholder), recipient parsing (comma lists, blanks), SMTP TLS auto-detection per port and explicit modes (incl. graceful STARTTLS-not-supported fallback), combined email alerts (`EmailMessage` API, subject, body, To/Cc/Bcc, anti-spam flag, SMTP failure, missing recipients), MQTT message handling, and full `run()` lifecycle including cleanup on exceptions. Anti-spam across runs (`_recent_alert_sent`) is covered with 4 tests. All external dependencies (`paho-mqtt`, `mysql.connector`, `smtplib`) are mocked — no broker, DB, or SMTP server required.

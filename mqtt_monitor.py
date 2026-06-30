@@ -7,7 +7,7 @@ import subprocess
 import threading
 from datetime import datetime, timedelta
 from email.message import EmailMessage
-import paho.mqtt.client as mqtt
+from paho.mqtt import client as mqtt
 import mysql.connector
 
 CONFIG_PATH_DEFAULT = 'config.ini'
@@ -98,7 +98,7 @@ class MQTTMonitor:
         self.last_message_time = None
         self.alert_sent = False
         self.conn = None
-        self.client = mqtt.Client()
+        self.client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
 
@@ -128,7 +128,7 @@ class MQTTMonitor:
             logging.error(f"Database connection failed: {e}")
             raise
 
-    def on_connect(self, client, userdata, flags, rc):
+    def on_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
             logging.info("Connected to MQTT broker")
             client.subscribe(f"{self.cfg['mqtt']['publisher_client_id']}/#")
@@ -214,6 +214,26 @@ class MQTTMonitor:
                 self.conn.rollback()
             except Exception:
                 pass
+
+    def _recent_alert_sent(self, within_minutes=60):
+        """Check if an ERROR status was logged recently for this publisher.
+        Prevents spamming one mail per cron run when the same condition persists."""
+        try:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT timestamp FROM mqtt_status
+                WHERE publisher = %s AND status = 'ERROR'
+                ORDER BY id DESC LIMIT 1
+            """, (self.cfg['mqtt']['publisher_client_id'],))
+            row = cur.fetchone()
+            cur.close()
+            if not row:
+                return False
+            age_minutes = (datetime.now() - row[0]).total_seconds() / 60
+            return age_minutes < within_minutes
+        except Exception as e:
+            logging.error(f"Failed to check recent alert: {e}")
+            return False
 
     def _parse_recipients(self, value):
         if not value:
@@ -321,7 +341,13 @@ class MQTTMonitor:
 
             if sections:
                 logging.warning(f"Issues detected: {len(sections)}")
-                self.send_alert(sections)
+                if self._recent_alert_sent():
+                    logging.info(
+                        "Skipping email: similar ERROR status was logged within "
+                        "the last hour. The new entry is recorded in the DB."
+                    )
+                else:
+                    self.send_alert(sections)
             else:
                 logging.info(f"All checks passed: {status_msg}")
 
