@@ -13,7 +13,7 @@ Monitors MQTT publisher activity and host reachability, sends combined alerts vi
 
 1. **Clone repository**
    ```bash
-   git clone https://github.com/loftmyndgmbh/mqtt-monitoring.git
+   git clone https://github.com/loftmyndchgmbh/mqtt-monitoring.git
    cd mqtt-monitoring
    ```
 
