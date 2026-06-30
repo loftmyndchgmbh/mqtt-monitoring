@@ -1,0 +1,6 @@
+[REMOTE_DB]
+host = your-cyon-host.cyon.ch
+port = 3306
+database = your-database-name
+user = your-db-user
+password = your-db-password
