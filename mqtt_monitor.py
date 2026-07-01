@@ -1,16 +1,19 @@
 import os
+import sys
 import configparser
 import time as _time
 import smtplib
 import logging
 import subprocess
 import threading
+import fcntl
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from paho.mqtt import client as mqtt
 import mysql.connector
 
 CONFIG_PATH_DEFAULT = 'config.ini'
+LOCK_FILE_PATH = '/tmp/mqtt_monitor.lock'
 
 logging.basicConfig(
     level=logging.INFO,
@@ -363,5 +366,12 @@ class MQTTMonitor:
 
 
 if __name__ == "__main__":
+    lock_file = open(LOCK_FILE_PATH, 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logging.warning("Another instance of mqtt_monitor.py is already running. Exiting.")
+        sys.exit(0)
+
     monitor = MQTTMonitor()
     monitor.run()
